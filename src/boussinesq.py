@@ -52,7 +52,8 @@ Newton-like iterations:
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 # ----------------------------
 # 1) FD operators on uniform z-grid
@@ -637,24 +638,96 @@ def newton_solve(
     return x
 
 
+def plot_surface(ax, X, Y, Z, title, xlabel, ylabel, zlabel=None):
+    surf = ax.plot_surface(X, Y, Z, rstride=1, cstride=1, linewidth=0, antialiased=True)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if zlabel is not None:
+        ax.set_zlabel(zlabel)
+    ax.view_init(elev=18, azim=-60)
+    return surf
+
+def visualize_solution(om, u1, u2, ph, ps, y1, y2, y1_lim=(-20, 20), y2_lim=(0, 20)):
+    """
+    Make paper-like 3D surface plots on the physical coordinates (y1,y2),
+    cropping to a nice visible window.
+    """
+    # y1,y2 are 2D arrays with indexing="ij"
+    # Select a window in physical space
+    mask_y1 = (y1[:, 0] >= y1_lim[0]) & (y1[:, 0] <= y1_lim[1])
+    mask_y2 = (y2[0, :] >= y2_lim[0]) & (y2[0, :] <= y2_lim[1])
+
+    I = np.where(mask_y1)[0]
+    J = np.where(mask_y2)[0]
+    if I.size < 3 or J.size < 3:
+        print("Visualization window too small for chosen limits; skipping plots.")
+        return
+
+    Y1 = y1[np.ix_(I, J)]
+    Y2 = y2[np.ix_(I, J)]
+
+    Om = om[np.ix_(I, J)]
+    Ph = ph[np.ix_(I, J)]
+    Ps = ps[np.ix_(I, J)]
+    U1 = u1[np.ix_(I, J)]
+    U2 = u2[np.ix_(I, J)]
+
+    fig = plt.figure(figsize=(14, 7))
+
+    ax1 = fig.add_subplot(2, 3, 1, projection="3d")
+    plot_surface(ax1, Y1, Y2, Om, r"$\Omega$", r"$y_1$", r"$y_2$")
+
+    ax2 = fig.add_subplot(2, 3, 2, projection="3d")
+    plot_surface(ax2, Y1, Y2, Ph, r"$\Phi$", r"$y_1$", r"$y_2$")
+
+    ax3 = fig.add_subplot(2, 3, 3, projection="3d")
+    plot_surface(ax3, Y1, Y2, Ps, r"$\Psi$", r"$y_1$", r"$y_2$")
+
+    ax4 = fig.add_subplot(2, 3, 4, projection="3d")
+    plot_surface(ax4, Y1, Y2, U1, r"$U_1$", r"$y_1$", r"$y_2$")
+
+    ax5 = fig.add_subplot(2, 3, 5, projection="3d")
+    plot_surface(ax5, Y1, Y2, U2, r"$U_2$", r"$y_1$", r"$y_2$")
+
+    ax6 = fig.add_subplot(2, 3, 6)
+    ax6.axis("off")
+    ax6.text(0.05, 0.6, "Self-similar\nsolution", fontsize=18)
+
+    plt.tight_layout()
+    plt.show()
+
 def main():
-    # Half-plane example: n2 roughly half of a full 257 resolution.
+    n1, n2 = 257, 129
+    L1, L2 = 60.0, 60.0
+
     x = newton_solve(
-        n1=257, n2=129,
-        L1=60.0, L2=60.0,
-        maxit=200,
+        n1=n1, n2=n2,
+        L1=L1, L2=L2,
+        maxit=100,
         lsqr_damp=1e-1,
         step_cap=1.0,
-        w_gauge=100.0,
-        w_wall=10.0,
-        w_far=10.0,
-        enforce_reflection_wall=True,  # set False if you ONLY want U2=0 at wall
+        enforce_reflection_wall=True,
     )
 
-    # postprocess
-    om, u1, u2, ph, ps, lam = unpack_full(x, 257, 129)
+    # ---- rebuild physical grid for plotting ----
+    z1 = np.linspace(-L1 / 2, L1 / 2, n1)
+    z2 = np.linspace(0.0, L2 / 2, n2)
+    Z1, Z2 = np.meshgrid(z1, z2, indexing="ij")
+    y1 = np.sinh(Z1)
+    y2 = np.sinh(Z2)
+
+    # ---- unpack solution ----
+    om, u1, u2, ph, ps, lam = unpack_full(x, n1, n2)
     print(f"Done. lambda={lam:.12g}")
 
+    # ---- visualize ----
+    visualize_solution(
+        om, u1, u2, ph, ps,
+        y1, y2,
+        y1_lim=(-20, 20),
+        y2_lim=(0, 20),
+    )
 
 if __name__ == "__main__":
     main()
