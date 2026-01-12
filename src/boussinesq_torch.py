@@ -443,8 +443,8 @@ def main():
         n1=n1, n2=n2, L1=L1, L2=L2,
         adv_scheme="upwind",              # try "central" to compare
         enforce_reflection_wall=True,
-        max_lbfgs_steps=400,
-        print_every=20,
+        max_lbfgs_steps=1000,
+        print_every=50,
     )
 
     print(f"Done. lambda={fields.lam.detach().cpu().item():.12g}")
