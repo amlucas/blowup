@@ -150,7 +150,7 @@ def dy2_upwind(f, W2, h2, s2):
 # ----------------------------
 
 class Fields(torch.nn.Module):
-    def __init__(self, n1, n2, init_eps=1e-3, lam0=0.3, device="cpu", dtype=torch.float64):
+    def __init__(self, n1, n2, init_eps=1e-3, lam0=1.9, device="cpu", dtype=torch.float64):
         super().__init__()
         self.n1, self.n2 = n1, n2
         # Store as parameters
@@ -159,7 +159,8 @@ class Fields(torch.nn.Module):
         self.U2    = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
         self.Phi   = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
         self.Psi   = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
-        self.lam   = torch.nn.Parameter(torch.tensor(float(lam0), device=device, dtype=dtype))
+        #self.lam   = torch.nn.Parameter(torch.tensor(float(lam0), device=device, dtype=dtype))
+        self.lam   = torch.tensor(float(lam0), device=device, dtype=dtype)
 
         # small random init for U,Phi,Psi
         torch.manual_seed(0)
@@ -324,6 +325,7 @@ def solve_torch(
     dtype=torch.float64,
     max_lbfgs_steps=300,
     print_every=10,
+    lam0=3.0,
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -332,7 +334,7 @@ def solve_torch(
     _, _, _, _, _, _, Y1, Y2, _, _ = grids
     masks = make_masks(n1, n2, device=device)
 
-    fields = Fields(n1, n2, init_eps=1e-3, lam0=0.3, device=device, dtype=dtype)
+    fields = Fields(n1, n2, init_eps=1e-3, lam0=lam0, device=device, dtype=dtype)
     seed_omega_from_y(fields, Y1, Y2)
 
     # weights (tune these)
@@ -436,15 +438,16 @@ def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20), title_suf
 def main():
     torch.set_default_dtype(torch.float64)
 
-    n1, n2 = 257, 129
+    n1, n2 = 513, 257
     L1, L2 = 60.0, 60.0
 
     fields, grids = solve_torch(
         n1=n1, n2=n2, L1=L1, L2=L2,
         adv_scheme="upwind",              # try "central" to compare
         enforce_reflection_wall=True,
-        max_lbfgs_steps=1000,
+        max_lbfgs_steps=10000,
         print_every=50,
+        lam0=3.0
     )
 
     print(f"Done. lambda={fields.lam.detach().cpu().item():.12g}")
