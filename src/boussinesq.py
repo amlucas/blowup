@@ -1,66 +1,62 @@
 #!/usr/bin/env python3
-"""
-PyTorch loss-based solve for 2D Boussinesq self-similar profile (vorticity formulation, no pressure)
-Half-plane only: y2 >= 0, via z-mapping:
-  y1 = sinh(z1),  z1 ∈ [-L1/2, L1/2]
-  y2 = sinh(z2),  z2 ∈ [0,     L2/2]
-
-Unknowns on grid (with enforced y1 symmetries by construction):
-  U1 (odd in y1), U2 (even in y1), Phi (odd in y1), Psi (even in y1)
-  + scalar lambda
-
-Derived quantity:
-  Omega := d_y1 U2 - d_y2 U1   (computed each forward pass)
-
-Residuals enforced on INTERIOR nodes only:
-  R_om   = Omega + W·∇Omega - Phi
-  R_phi  = (2 + d_y1 U1)*Phi + W·∇Phi + (d_y1 U2)*Psi
-  R_psi  = (2 + d_y2 U2)*Psi + W·∇Psi + (d_y2 U1)*Phi
-  R_div  = d_y1 U1 + d_y2 U2
-  R_comp = d_y1 Psi - d_y2 Phi
-
-where W = (1+lambda)*y + U.
-
-Boundary conditions (losses only on boundary nodes):
-  Wall z2=0:
-    always: U2=0
-    optional reflection-consistent:
-      Psi=0, d_y2 U1=0, d_y2 Phi=0, d_y2 Omega=0
-
-  Far boundary (i=0, i=n1-1, j=n2-1; excluding wall):
-    Phi=0, Psi=0, and U gradients flat: U1_y1=U1_y2=U2_y1=U2_y2=0
-
-Gauge:
-  (d_y1 Omega)(0,0) = -1 at z1=0 center, z2=0 wall.
-"""
-
 import math
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
+
+# ----------------------------
+# Grids: centers + faces in y
+# ----------------------------
+
 def make_grids(n1, n2, L1, L2, device, dtype):
-    z1 = torch.linspace(-L1/2, L1/2, n1, device=device, dtype=dtype)
-    z2 = torch.linspace(0.0,   L2/2, n2, device=device, dtype=dtype)
-    dz1 = z1[1] - z1[0]
-    dz2 = z2[1] - z2[0]
-    Z1, Z2 = torch.meshgrid(z1, z2, indexing="ij")
-    Y1 = torch.sinh(Z1)
-    Y2 = torch.sinh(Z2)
-    s1 = 1.0 / torch.cosh(z1)  # (n1,)
-    s2 = 1.0 / torch.cosh(z2)  # (n2,)
-    return z1, z2, dz1, dz2, Z1, Z2, Y1, Y2, s1, s2
+    assert n1 % 2 == 1
+
+    z1_c = torch.linspace(-L1/2, L1/2, n1, device=device, dtype=dtype)
+    z2_c = torch.linspace(0.0,   L2/2, n2, device=device, dtype=dtype)
+    dz1 = z1_c[1] - z1_c[0]
+    dz2 = z2_c[1] - z2_c[0]
+
+    # faces (midpoints + extrapolated)
+    z1_f = torch.empty((n1+1,), device=device, dtype=dtype)
+    z2_f = torch.empty((n2+1,), device=device, dtype=dtype)
+    z1_f[1:-1] = 0.5 * (z1_c[1:] + z1_c[:-1])
+    z2_f[1:-1] = 0.5 * (z2_c[1:] + z2_c[:-1])
+    z1_f[0]  = z1_c[0]  - 0.5*dz1
+    z1_f[-1] = z1_c[-1] + 0.5*dz1
+    z2_f[0]  = z2_c[0]  - 0.5*dz2   # ghost below wall
+    z2_f[-1] = z2_c[-1] + 0.5*dz2
+
+    y1_c = torch.sinh(z1_c)
+    y2_c = torch.sinh(z2_c)
+    y1_f = torch.sinh(z1_f)
+    y2_f = torch.sinh(z2_f)
+
+    dy1_c = y1_f[1:] - y1_f[:-1]   # (n1,)
+    dy2_c = y2_f[1:] - y2_f[:-1]   # (n2,)
+
+    Y1c, Y2c = torch.meshgrid(y1_c, y2_c, indexing="ij")  # centers
+    Y1x, Y2x = torch.meshgrid(y1_f, y2_c, indexing="ij")  # x-faces
+    Y1y, Y2y = torch.meshgrid(y1_c, y2_f, indexing="ij")  # y-faces
+
+    return {
+        "z1_c": z1_c, "z2_c": z2_c, "dz1": dz1, "dz2": dz2,
+        "z1_f": z1_f, "z2_f": z2_f,
+        "y1_c": y1_c, "y2_c": y2_c,
+        "y1_f": y1_f, "y2_f": y2_f,
+        "dy1_c": dy1_c, "dy2_c": dy2_c,
+        "Y1c": Y1c, "Y2c": Y2c,
+        "Y1x": Y1x, "Y2x": Y2x,
+        "Y1y": Y1y, "Y2y": Y2y,
+    }
 
 
 def make_masks(n1, n2, device):
     interior = torch.ones((n1, n2), device=device, dtype=torch.bool)
-    interior[:, 0] = False
     interior[0, :] = False
     interior[-1, :] = False
+    interior[:, 0] = False
     interior[:, -1] = False
-
-    wall = torch.zeros((n1, n2), device=device, dtype=torch.bool)
-    wall[:, 0] = True
 
     far = torch.zeros((n1, n2), device=device, dtype=torch.bool)
     far[0, :] = True
@@ -68,78 +64,40 @@ def make_masks(n1, n2, device):
     far[:, -1] = True
     far[:, 0] = False
 
-    return interior, wall, far
+    wall_centers = torch.zeros((n1, n2), device=device, dtype=torch.bool)
+    wall_centers[:, 0] = True
+
+    return {"interior": interior, "far": far, "wall_centers": wall_centers}
 
 
-def dz1_central(f, h1):
-    out = torch.empty_like(f)
-    out[1:-1, :] = (f[2:, :] - f[:-2, :]) / (2*h1)
-    out[0, :]    = (-3*f[0, :] + 4*f[1, :] - f[2, :]) / (2*h1)
-    out[-1, :]   = (3*f[-1, :] - 4*f[-2, :] + f[-3, :]) / (2*h1)
-    return out
-
-
-def dz2_central(f, h2):
-    out = torch.empty_like(f)
-    out[:, 1:-1] = (f[:, 2:] - f[:, :-2]) / (2*h2)
-    out[:, 0]    = (-3*f[:, 0] + 4*f[:, 1] - f[:, 2]) / (2*h2)
-    out[:, -1]   = (3*f[:, -1] - 4*f[:, -2] + f[:, -3]) / (2*h2)
-    return out
-
-
-def dy1_from_dz1(f, h1, s1):
-    return dz1_central(f, h1) * s1[:, None]
-
-
-def dy2_from_dz2(f, h2, s2):
-    return dz2_central(f, h2) * s2[None, :]
-
-
-def dy1_upwind(f, W1, h1, s1):
-    df_b = torch.empty_like(f)
-    df_f = torch.empty_like(f)
-
-    df_b[1:, :] = (f[1:, :] - f[:-1, :]) / h1
-    df_b[0, :]  = (f[1, :] - f[0, :]) / h1
-
-    df_f[:-1, :] = (f[1:, :] - f[:-1, :]) / h1
-    df_f[-1, :]  = (f[-1, :] - f[-2, :]) / h1
-
-    return torch.where(W1 >= 0, df_b, df_f) * s1[:, None]
-
-
-def dy2_upwind(f, W2, h2, s2):
-    df_b = torch.empty_like(f)
-    df_f = torch.empty_like(f)
-
-    df_b[:, 1:] = (f[:, 1:] - f[:, :-1]) / h2
-    df_b[:, 0]  = (f[:, 1] - f[:, 0]) / h2
-
-    df_f[:, :-1] = (f[:, 1:] - f[:, :-1]) / h2
-    df_f[:, -1]  = (f[:, -1] - f[:, -2]) / h2
-
-    return torch.where(W2 >= 0, df_b, df_f) * s2[None, :]
-
-
+# ----------------------------
+# Fields with correct y1 parity
+# ----------------------------
 
 class Fields(torch.nn.Module):
     """
-    Enforce y1-parity exactly by parameterizing only the y1>=0 half
-    and reflecting with +/- symmetry.
-
-    Odd in y1:  U1, Phi
-    Even in y1: U2, Psi
-    Omega is derived from U and will then be odd automatically.
+    Staggered MAC layout:
+      U1x: x-faces (n1+1,n2)  odd in y1
+      U2y: y-faces (n1,n2+1)  even in y1
+      Phi: centers (n1,n2)    odd in y1
+      Psi: centers (n1,n2)    even in y1
     """
-    def __init__(self, n1, n2, lam0=1.9, device="cpu", dtype=torch.float64, learn_lambda=False):
+    def __init__(self, n1, n2, lam0=1.9, init_eps=1e-3, device="cpu", dtype=torch.float64, learn_lambda=False):
         super().__init__()
-        assert n1 % 2 == 1, "Need odd n1 so that y1=0 is a gridline."
+        assert n1 % 2 == 1
         self.n1, self.n2 = n1, n2
         self.i0 = n1 // 2
-        self.n1h = n1 - self.i0  # includes centerline + positive side
 
-        self._U1_h  = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
-        self._U2_h  = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
+        # number of positive x-faces (strictly y1>0): since faces count is n1+1 even, half is (n1+1)/2
+        self.nx_pos = (n1 + 1) // 2          # 129 for n1=257
+        self.ic0f = self.nx_pos              # first positive-face index in full array
+
+        # number of positive centers including centerline: n1 - i0
+        self.n1h = n1 - self.i0              # 129 for n1=257
+
+        # half parameters
+        self._U1x_p = torch.nn.Parameter(torch.zeros((self.nx_pos, n2), device=device, dtype=dtype))
+        self._U2y_h = torch.nn.Parameter(torch.zeros((self.n1h, n2+1), device=device, dtype=dtype))
         self._Phi_h = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
         self._Psi_h = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
 
@@ -148,151 +106,197 @@ class Fields(torch.nn.Module):
         else:
             self.lam = torch.tensor(float(lam0), device=device, dtype=dtype)
 
+        torch.manual_seed(0)
+        for p in [self._U1x_p, self._U2y_h, self._Phi_h, self._Psi_h]:
+            p.data[:] = init_eps * torch.randn_like(p.data)
+
+        # odd centerline at centers:
+        self._Phi_h.data[0, :] = 0.0
+
+        # For U1x there is no face at y1=0. Don’t force any special row to 0 here.
+
     @staticmethod
-    def _reflect_even(pos):
+    def _reflect_even_centers(pos):
         neg = torch.flip(pos[1:], dims=[0])
         return torch.cat([neg, pos], dim=0)
 
     @staticmethod
-    def _reflect_odd(pos):
+    def _reflect_odd_centers(pos):
         neg = torch.flip(pos[1:], dims=[0])
         center = torch.zeros_like(pos[:1])
         return torch.cat([-neg, center, pos[1:]], dim=0)
 
-    @property
-    def U1(self):
-        pos = self._U1_h.clone()
-        pos[0, :] = 0.0
-        return self._reflect_odd(pos)
+    @staticmethod
+    def _reflect_even_faces(pos):
+        # full = [flip(pos), pos], no shared center face
+        neg = torch.flip(pos, dims=[0])
+        return torch.cat([neg, pos], dim=0)
+
+    @staticmethod
+    def _reflect_odd_faces(pos):
+        # full = [-flip(pos), pos], no shared center face
+        neg = torch.flip(pos, dims=[0])
+        return torch.cat([-neg, pos], dim=0)
 
     @property
     def Phi(self):
         pos = self._Phi_h.clone()
         pos[0, :] = 0.0
-        return self._reflect_odd(pos)
-
-    @property
-    def U2(self):
-        return self._reflect_even(self._U2_h)
+        return self._reflect_odd_centers(pos)
 
     @property
     def Psi(self):
-        return self._reflect_even(self._Psi_h)
+        return self._reflect_even_centers(self._Psi_h)
+
+    @property
+    def U2y(self):
+        return self._reflect_even_centers(self._U2y_h)
+
+    @property
+    def U1x(self):
+        return self._reflect_odd_faces(self._U1x_p)
 
 
-@torch.no_grad()
-def init_fields(fields: Fields, Y1: torch.Tensor, Y2: torch.Tensor,
-                R1=20.0, R2=20.0, d1=2.0, d2=2.0):
-    """
-    Initialize:
-      U1 = -y1 * chi(y1,y2),  U2 = y2 * chi(y1,y2)
-    where chi ~ 1 inside |y1|<R1 and y2<R2, and smoothly decays to 0 outside.
-    This is consistent with 'flat' far-field gradients.
-    """
-    device = Y1.device
-    dtype = Y1.dtype
+# ----------------------------
+# FV one-sided gradients on centers
+# ----------------------------
 
-    # smooth cutoffs (tanh-based)
-    absY1 = torch.abs(Y1)
-    chi1 = 0.5 * (1.0 - torch.tanh((absY1 - torch.tensor(R1, device=device, dtype=dtype)) /
-                                  torch.tensor(d1, device=device, dtype=dtype)))
-    chi2 = 0.5 * (1.0 - torch.tanh((Y2 - torch.tensor(R2, device=device, dtype=dtype)) /
-                                  torch.tensor(d2, device=device, dtype=dtype)))
-    chi = chi1 * chi2
-
-    U1_full = -Y1 * chi
-    U2_full = Y2 * chi
-
-    # copy to half-params (i>=i0)
-    i0 = fields.i0
-    fields._U1_h.data[:] = U1_full[i0:, :].clone()
-    fields._U2_h.data[:] = U2_full[i0:, :].clone()
-
-    # enforce odd centerline for U1
-    fields._U1_h.data[0, :] = 0.0
-
-    # Phi/Psi init
-    fields._Phi_h.data.zero_()
-    fields._Psi_h.data.zero_()
+def grad_bwd_y1_center(qc, dy1_c):
+    # qc (n1,n2), dy1_c (n1,)
+    out = torch.empty_like(qc)
+    out[1:, :] = (qc[1:, :] - qc[:-1, :]) / (0.5*(dy1_c[1:, None] + dy1_c[:-1, None]))
+    out[0, :]  = (qc[1, :] - qc[0, :]) / dy1_c[0]
+    return out
 
 
-def pde_residuals(fields: Fields, Y1, Y2, dz1, dz2, s1, s2, adv_scheme="upwind"):
-    U1, U2, Ph, Ps = fields.U1, fields.U2, fields.Phi, fields.Psi
+def grad_bwd_y2_center(qc, dy2_c):
+    out = torch.empty_like(qc)
+    out[:, 1:] = (qc[:, 1:] - qc[:, :-1]) / (0.5*(dy2_c[None, 1:] + dy2_c[None, :-1]))
+    out[:, 0]  = (qc[:, 1] - qc[:, 0]) / dy2_c[0]
+    return out
+
+
+# ----------------------------
+# MAC divergence at centers (exact FV)
+# ----------------------------
+
+def div_U(U1x, U2y, dy1_c, dy2_c):
+    # U1x (n1+1,n2) -> diff gives (n1,n2), divide by dy1_c
+    d1 = (U1x[1:, :] - U1x[:-1, :]) / dy1_c[:, None]
+    d2 = (U2y[:, 1:] - U2y[:, :-1]) / dy2_c[None, :]
+    return d1 + d2
+
+
+# ----------------------------
+# Omega on centers with one-sided FV (no central)
+# ----------------------------
+
+def omega_center(U1x, U2y, dy1_c, dy2_c):
+    U1c = 0.5 * (U1x[1:, :] + U1x[:-1, :])      # (n1,n2)
+    U2c = 0.5 * (U2y[:, 1:] + U2y[:, :-1])      # (n1,n2)
+
+    dU2_dy1 = grad_bwd_y1_center(U2c, dy1_c)
+    dU1_dy2 = grad_bwd_y2_center(U1c, dy2_c)
+    Om = dU2_dy1 - dU1_dy2
+    return Om, U1c, U2c, dU2_dy1, dU1_dy2
+
+
+# ----------------------------
+# Upwind FV advection of center scalar
+# ----------------------------
+
+def center_to_xface_lr(qc):
+    n1, n2 = qc.shape
+    qL = torch.empty((n1+1, n2), device=qc.device, dtype=qc.dtype)
+    qR = torch.empty_like(qL)
+    qL[1:-1, :] = qc[:-1, :]
+    qR[1:-1, :] = qc[1:, :]
+    qL[0, :] = qc[0, :];   qR[0, :] = qc[0, :]
+    qL[-1, :] = qc[-1, :]; qR[-1, :] = qc[-1, :]
+    return qL, qR
+
+
+def center_to_yface_bt(qc):
+    n1, n2 = qc.shape
+    qB = torch.empty((n1, n2+1), device=qc.device, dtype=qc.dtype)
+    qT = torch.empty_like(qB)
+    qB[:, 1:-1] = qc[:, :-1]
+    qT[:, 1:-1] = qc[:, 1:]
+    qB[:, 0] = qc[:, 0];   qT[:, 0] = qc[:, 0]
+    qB[:, -1] = qc[:, -1]; qT[:, -1] = qc[:, -1]
+    return qB, qT
+
+
+def fv_advective_term(qc, W1x, W2y, dy1_c, dy2_c, divW_c):
+    qL, qR = center_to_xface_lr(qc)
+    qB, qT = center_to_yface_bt(qc)
+
+    qx = torch.where(W1x >= 0, qL, qR)
+    qy = torch.where(W2y >= 0, qB, qT)
+
+    Fx = W1x * qx
+    Fy = W2y * qy
+
+    divF = (Fx[1:, :] - Fx[:-1, :]) / dy1_c[:, None] + (Fy[:, 1:] - Fy[:, :-1]) / dy2_c[None, :]
+    return divF - qc * divW_c
+
+
+# ----------------------------
+# Residuals + loss
+# ----------------------------
+
+def residuals(fields: Fields, grids):
+    dy1_c, dy2_c = grids["dy1_c"], grids["dy2_c"]
+
+    U1x = fields.U1x
+    U2y = fields.U2y
+    Phi = fields.Phi
+    Psi = fields.Psi
     lam = fields.lam
 
-    W1 = (1.0 + lam) * Y1 + U1
-    W2 = (1.0 + lam) * Y2 + U2
+    DivU = div_U(U1x, U2y, dy1_c, dy2_c)
+    Om, U1c, U2c, dU2_dy1, dU1_dy2 = omega_center(U1x, U2y, dy1_c, dy2_c)
 
-    # central derivatives (for div/curl/comp and source terms)
-    U1_y1 = dy1_from_dz1(U1, dz1, s1)
-    U1_y2 = dy2_from_dz2(U1, dz2, s2)
-    U2_y1 = dy1_from_dz1(U2, dz1, s1)
-    U2_y2 = dy2_from_dz2(U2, dz2, s2)
+    W1x = (1.0 + lam) * grids["Y1x"] + U1x
+    W2y = (1.0 + lam) * grids["Y2y"] + U2y
+    DivW = 2.0 * (1.0 + lam) + DivU
 
-    Ph_y1_c = dy1_from_dz1(Ph, dz1, s1)
-    Ph_y2_c = dy2_from_dz2(Ph, dz2, s2)
-    Ps_y1_c = dy1_from_dz1(Ps, dz1, s1)
-    Ps_y2_c = dy2_from_dz2(Ps, dz2, s2)
+    adv_Om = fv_advective_term(Om,  W1x, W2y, dy1_c, dy2_c, DivW)
+    adv_Ph = fv_advective_term(Phi, W1x, W2y, dy1_c, dy2_c, DivW)
+    adv_Ps = fv_advective_term(Psi, W1x, W2y, dy1_c, dy2_c, DivW)
 
-    # Omega derived from U (SIGN HERE)
-    Omega = U2_y1 - U1_y2
+    # source terms
+    dU1_dy1 = (U1x[1:, :] - U1x[:-1, :]) / dy1_c[:, None]
+    dU2_dy2 = (U2y[:, 1:] - U2y[:, :-1]) / dy2_c[None, :]
 
-    # Omega derivatives for advection
-    Om_y1_c = dy1_from_dz1(Omega, dz1, s1)
-    Om_y2_c = dy2_from_dz2(Omega, dz2, s2)
+    # compatibility (one-sided)
+    dPsi_dy1 = grad_bwd_y1_center(Psi, dy1_c)
+    dPhi_dy2 = grad_bwd_y2_center(Phi, dy2_c)
+    R_comp = dPsi_dy1 - dPhi_dy2
 
-    # advection derivatives
-    if adv_scheme == "upwind":
-        Om_y1 = dy1_upwind(Omega, W1, dz1, s1)
-        Om_y2 = dy2_upwind(Omega, W2, dz2, s2)
-        Ph_y1 = dy1_upwind(Ph, W1, dz1, s1)
-        Ph_y2 = dy2_upwind(Ph, W2, dz2, s2)
-        Ps_y1 = dy1_upwind(Ps, W1, dz1, s1)
-        Ps_y2 = dy2_upwind(Ps, W2, dz2, s2)
-    elif adv_scheme == "central":
-        Om_y1, Om_y2 = Om_y1_c, Om_y2_c
-        Ph_y1, Ph_y2 = Ph_y1_c, Ph_y2_c
-        Ps_y1, Ps_y2 = Ps_y1_c, Ps_y2_c
-    else:
-        raise ValueError("adv_scheme must be 'upwind' or 'central'.")
-
-    adv_Om = W1 * Om_y1 + W2 * Om_y2
-    adv_Ph = W1 * Ph_y1 + W2 * Ph_y2
-    adv_Ps = W1 * Ps_y1 + W2 * Ps_y2
-
-    R_om   = Omega + adv_Om - Ph
-    R_phi  = (2.0 + U1_y1) * Ph + adv_Ph + (U2_y1) * Ps
-    R_psi  = (2.0 + U2_y2) * Ps + adv_Ps + (U1_y2) * Ph
-    R_div  = U1_y1 + U2_y2
-    R_comp = Ps_y1_c - Ph_y2_c
+    R_om  = Om + adv_Om - Phi
+    R_phi = (2.0 + dU1_dy1) * Phi + adv_Ph + dU2_dy1 * Psi
+    R_psi = (2.0 + dU2_dy2) * Psi + adv_Ps + dU1_dy2 * Phi
+    R_div = DivU
 
     return {
-        "R_om": R_om,
-        "R_phi": R_phi,
-        "R_psi": R_psi,
-        "R_div": R_div,
-        "R_comp": R_comp,
-        "U1_y2": U1_y2,
-        "Ph_y2": Ph_y2_c,
-        "Omega": Omega,
-        "Omega_y2": Om_y2_c,
-        "Omega_y1": Om_y1_c,
+        "R_om": R_om, "R_phi": R_phi, "R_psi": R_psi, "R_div": R_div, "R_comp": R_comp,
+        "Omega": Om, "DivU": DivU,
+        "U1c": U1c, "U2c": U2c,
     }
 
 
-# ----------------------------
-# Loss
-# ----------------------------
+def mse_mask(A, mask):
+    v = A[mask]
+    return torch.mean(v*v)
 
-def loss_total(fields: Fields, grids, masks, weights, adv_scheme="upwind", enforce_reflection_wall=True):
-    z1, z2, dz1, dz2, Z1, Z2, Y1, Y2, s1, s2 = grids
-    interior, wall, far = masks
 
-    res = pde_residuals(fields, Y1, Y2, dz1, dz2, s1, s2, adv_scheme=adv_scheme)
+def loss_total(fields: Fields, grids, masks, weights, enforce_reflection_wall=True):
+    interior = masks["interior"]
+    far = masks["far"]
+    wall_centers = masks["wall_centers"]
 
-    def mse_mask(A, mask):
-        v = A[mask]
-        return torch.mean(v*v)
+    res = residuals(fields, grids)
 
     L_pde = (
         mse_mask(res["R_om"], interior) +
@@ -302,70 +306,118 @@ def loss_total(fields: Fields, grids, masks, weights, adv_scheme="upwind", enfor
         mse_mask(res["R_comp"], interior)
     )
 
-    # Gauge: (dy1 Omega)(0,0) = -1
-    i0 = fields.n1 // 2
+    # gauge at (y1=0,y2=0): use centerline i0 and neighbor i0+1, j=0
+    i0 = fields.i0
     j0 = 0
-    dy1_Om = res["Omega_y1"]
-    g = dy1_Om[i0, j0] + 1.0
+    dy1_c = grids["dy1_c"]
+    Om = res["Omega"]
+    dy_between = 0.5 * (dy1_c[i0] + dy1_c[i0+1])
+    dOm_dy1_00 = (Om[i0+1, j0] - Om[i0, j0]) / dy_between
+    g = dOm_dy1_00 + 1.0
     L_g = g*g
 
-    # Wall BCs
-    U1, U2, Ph, Ps = fields.U1, fields.U2, fields.Phi, fields.Psi
-    L_wall = mse_mask(U2, wall)
+    # wall: U2y at wall face j=0 is 0
+    U2y = fields.U2y
+    L_wall = torch.mean(U2y[:, 0]*U2y[:, 0])
 
     if enforce_reflection_wall:
-        U1_y2 = res["U1_y2"]
-        Ph_y2 = res["Ph_y2"]
-        Om_y2 = res["Omega_y2"]
-        L_wall = L_wall + mse_mask(Ps, wall) + mse_mask(U1_y2, wall) + mse_mask(Ph_y2, wall) + mse_mask(Om_y2, wall)
+        Phi = fields.Phi
+        Psi = fields.Psi
 
-    # Far BCs
-    U1_y1 = dy1_from_dz1(U1, dz1, s1)
-    U1_y2 = dy2_from_dz2(U1, dz2, s2)
-    U2_y1 = dy1_from_dz1(U2, dz1, s1)
-    U2_y2 = dy2_from_dz2(U2, dz2, s2)
+        # Psi=0 at wall centers
+        L_wall = L_wall + mse_mask(Psi, wall_centers)
 
-    L_far = (
-        mse_mask(Ph, far) +
-        mse_mask(Ps, far) +
-        mse_mask(U1_y1, far) +
-        mse_mask(U1_y2, far) +
-        mse_mask(U2_y1, far) +
-        mse_mask(U2_y2, far)
+        # d_y2 Phi = 0 and d_y2 Omega = 0 at wall centers (forward difference)
+        dy2_c = grids["dy2_c"]
+        dy2_between = 0.5 * (dy2_c[0] + dy2_c[1])
+        dPhi_dy2_wall = (Phi[:, 1] - Phi[:, 0]) / dy2_between
+        dOm_dy2_wall  = (Om[:, 1]  - Om[:, 0])  / dy2_between
+        L_wall = L_wall + torch.mean(dPhi_dy2_wall**2) + torch.mean(dOm_dy2_wall**2)
+
+        # d_y2 U1x = 0 at wall for x-faces (forward)
+        U1x = fields.U1x
+        dU1x_dy2_wall = (U1x[:, 1] - U1x[:, 0]) / dy2_between
+        L_wall = L_wall + torch.mean(dU1x_dy2_wall**2)
+
+    # far: Phi=Psi=0 and flat grads of center velocities
+    Phi = fields.Phi
+    Psi = fields.Psi
+    L_far = mse_mask(Phi, far) + mse_mask(Psi, far)
+
+    U1c = res["U1c"]
+    U2c = res["U2c"]
+    dU1c_dy1 = grad_bwd_y1_center(U1c, dy1_c)
+    dU1c_dy2 = grad_bwd_y2_center(U1c, grids["dy2_c"])
+    dU2c_dy1 = grad_bwd_y1_center(U2c, dy1_c)
+    dU2c_dy2 = grad_bwd_y2_center(U2c, grids["dy2_c"])
+    L_far = L_far + mse_mask(dU1c_dy1, far) + mse_mask(dU1c_dy2, far) + mse_mask(dU2c_dy1, far) + mse_mask(dU2c_dy2, far)
+
+    L = (
+        weights["pde"] * L_pde +
+        weights["gauge"] * L_g +
+        weights["wall"] * L_wall +
+        weights["far"] * L_far
     )
 
-    L = \
-        weights["pde"]   * L_pde  + \
-        weights["gauge"] * L_g    + \
-        weights["wall"]  * L_wall + \
-        weights["far"]   * L_far
-
     stats = {
-        "L": L.detach().item(),
-        "L_pde": L_pde.detach().item(),
-        "L_g": L_g.detach().item(),
-        "L_wall": L_wall.detach().item(),
-        "L_far": L_far.detach().item(),
-        "dy1omega00": dy1_Om[i0, j0].detach().item(),
-        "lam": float(fields.lam.detach().item()),
+        "L": float(L.detach().cpu().item()),
+        "L_pde": float(L_pde.detach().cpu().item()),
+        "L_g": float(L_g.detach().cpu().item()),
+        "L_wall": float(L_wall.detach().cpu().item()),
+        "L_far": float(L_far.detach().cpu().item()),
+        "dy1Om00": float(dOm_dy1_00.detach().cpu().item()),
+        "lam": float(fields.lam.detach().cpu().item()),
     }
     return L, stats
 
 
 # ----------------------------
-# Optimization driver
+# Init
+# ----------------------------
+
+@torch.no_grad()
+def init_fields(fields: Fields, grids, R1=20.0, R2=20.0, d1=2.0, d2=2.0):
+    Y1c, Y2c = grids["Y1c"], grids["Y2c"]
+    absY1 = torch.abs(Y1c)
+    chi1 = 0.5 * (1.0 - torch.tanh((absY1 - R1) / d1))
+    chi2 = 0.5 * (1.0 - torch.tanh((Y2c  - R2) / d2))
+    chi_c = chi1 * chi2
+
+    # U1x init on faces
+    chi_x = torch.empty_like(grids["Y1x"])
+    chi_x[1:-1, :] = 0.5 * (chi_c[1:, :] + chi_c[:-1, :])
+    chi_x[0, :] = chi_c[0, :]
+    chi_x[-1, :] = chi_c[-1, :]
+    U1x_full = -grids["Y1x"] * chi_x
+
+    # U2y init on faces
+    chi_y = torch.empty_like(grids["Y2y"])
+    chi_y[:, 1:-1] = 0.5 * (chi_c[:, 1:] + chi_c[:, :-1])
+    chi_y[:, 0] = chi_c[:, 0]
+    chi_y[:, -1] = chi_c[:, -1]
+    U2y_full = grids["Y2y"] * chi_y
+    U2y_full[:, 0] = 0.0  # enforce wall
+
+    # pack into half
+    i0 = fields.i0
+    ic0f = fields.ic0f
+    fields._U1x_p.data[:] = U1x_full[ic0f:, :].clone()
+    fields._U2y_h.data[:] = U2y_full[i0:, :].clone()
+    fields._Phi_h.data.zero_()
+    fields._Psi_h.data.zero_()
+    fields._Phi_h.data[0, :] = 0.0
+
+
+# ----------------------------
+# Solve (Adam)
 # ----------------------------
 
 def solve_torch(
     n1=257, n2=129, L1=60.0, L2=60.0,
-    adv_scheme="upwind",
+    lam0=1.9, learn_lambda=False,
+    device=None, dtype=torch.float64,
+    iters=20000, lr=2e-3, print_every=200,
     enforce_reflection_wall=True,
-    device=None,
-    dtype=torch.float64,
-    max_lbfgs_steps=300,
-    print_every=10,
-    lam0=1.9,
-    learn_lambda=False,
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -373,104 +425,80 @@ def solve_torch(
     grids = make_grids(n1, n2, L1, L2, device=device, dtype=dtype)
     masks = make_masks(n1, n2, device=device)
 
-    fields = Fields(n1, n2, lam0=lam0, device=device, dtype=dtype, learn_lambda=learn_lambda)
+    fields = Fields(n1, n2, lam0=lam0, init_eps=1e-3, device=device, dtype=dtype, learn_lambda=learn_lambda)
+    init_fields(fields, grids)
 
-    _, _, _, _, _, _, Y1, Y2, _, _ = grids
-    init_fields(fields, Y1, Y2)
+    weights = {"pde": 50.0, "gauge": 10.0, "wall": 10.0, "far": 50.0}
 
-    # weights (tune these)
-    weights = {"pde": 100.0, "gauge": 10.0, "wall": 10.0, "far": 100.0}
+    opt = torch.optim.Adam(fields.parameters(), lr=lr)
 
-    opt = torch.optim.LBFGS(
-        fields.parameters(),
-        lr=1.0,
-        max_iter=20,
-        max_eval=25,
-        tolerance_grad=1e-10,
-        tolerance_change=1e-12,
-        history_size=50,
-        line_search_fn="strong_wolfe",
-    )
-
-    step = 0
-    last_stats = None
-
-    def closure():
-        nonlocal last_stats
+    for it in range(1, iters + 1):
         opt.zero_grad(set_to_none=True)
-        L, stats = loss_total(
-            fields, grids, masks, weights,
-            adv_scheme=adv_scheme,
-            enforce_reflection_wall=enforce_reflection_wall,
-        )
+        L, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
         L.backward()
-        last_stats = stats
-        return L
+        torch.nn.utils.clip_grad_norm_(fields.parameters(), max_norm=10.0)
+        opt.step()
 
-    outer_steps = math.ceil(max_lbfgs_steps / 20)
-    for k in range(outer_steps):
-        opt.step(closure)
-        step += 20
-        if (k % max(1, print_every // 20) == 0) and last_stats is not None:
-            s = last_stats
+        if it % print_every == 0 or it == 1:
             print(
-                f"[lbfgs ~{step:04d}] L={s['L']:.3e}  "
-                f"L_pde={s['L_pde']:.3e}  L_g={s['L_g']:.3e}  "
-                f"L_wall={s['L_wall']:.3e}  L_far={s['L_far']:.3e}  "
-                f"dy1Om00={s['dy1omega00']:.6f}  lam={s['lam']:.6f}"
+                f"[adam {it:06d}] "
+                f"L={stats['L']:.3e}  L_pde={stats['L_pde']:.3e}  "
+                f"L_g={stats['L_g']:.3e}  L_wall={stats['L_wall']:.3e}  L_far={stats['L_far']:.3e}  "
+                f"dy1Om00={stats['dy1Om00']:.6f}  lam={stats['lam']:.6f}"
             )
 
     return fields, grids
 
 
 # ----------------------------
-# Visualization
+# Viz
 # ----------------------------
 
-def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20), title_suffix=""):
-    z1, z2, dz1, dz2, Z1, Z2, Y1, Y2, s1, s2 = grids
+def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20)):
+    y1_c = grids["y1_c"].detach().cpu().numpy()
+    y2_c = grids["y2_c"].detach().cpu().numpy()
+    Y1c = grids["Y1c"].detach().cpu().numpy()
+    Y2c = grids["Y2c"].detach().cpu().numpy()
 
-    y1_line = Y1[:, 0].detach().cpu().numpy()
-    y2_line = Y2[0, :].detach().cpu().numpy()
+    I = np.where((y1_c >= y1_lim[0]) & (y1_c <= y1_lim[1]))[0]
+    J = np.where((y2_c >= y2_lim[0]) & (y2_c <= y2_lim[1]))[0]
 
-    I = np.where((y1_line >= y1_lim[0]) & (y1_line <= y1_lim[1]))[0]
-    J = np.where((y2_line >= y2_lim[0]) & (y2_line <= y2_lim[1]))[0]
-    if I.size < 3 or J.size < 3:
-        print("Visualization window too small; adjust y1_lim/y2_lim.")
-        return
-
-    def crop(T):
+    def crop_center(T):
         A = T.detach().cpu().numpy()
         return A[np.ix_(I, J)]
 
-    Y1c = crop(Y1)
-    Y2c = crop(Y2)
+    dy1_c = grids["dy1_c"]
+    dy2_c = grids["dy2_c"]
 
-    U1 = crop(fields.U1)
-    U2 = crop(fields.U2)
-    Ph = crop(fields.Phi)
-    Ps = crop(fields.Psi)
+    U1x = fields.U1x
+    U2y = fields.U2y
+    Om, U1c, U2c, _, _ = omega_center(U1x, U2y, dy1_c, dy2_c)
 
-    U1t, U2t = fields.U1, fields.U2
-    Omega_t = dy1_from_dz1(U2t, dz1, s1) - dy2_from_dz2(U1t, dz2, s2)
-    Om = crop(Omega_t)
+    Y1 = Y1c[np.ix_(I, J)]
+    Y2 = Y2c[np.ix_(I, J)]
+
+    Omc = crop_center(Om)
+    Phc = crop_center(fields.Phi)
+    Psc = crop_center(fields.Psi)
+    U1c = crop_center(U1c)
+    U2c = crop_center(U2c)
 
     fig = plt.figure(figsize=(14, 7))
 
     def surf(ax, Z, ttl):
-        ax.plot_surface(Y1c, Y2c, Z, rstride=1, cstride=1, linewidth=0, antialiased=True)
+        ax.plot_surface(Y1, Y2, Z, rstride=1, cstride=1, linewidth=0, antialiased=True)
         ax.set_title(ttl)
         ax.set_xlabel(r"$y_1$")
         ax.set_ylabel(r"$y_2$")
         ax.view_init(elev=18, azim=-60)
 
-    ax1 = fig.add_subplot(2, 3, 1, projection="3d"); surf(ax1, Om, r"$\Omega$"+title_suffix)
-    ax2 = fig.add_subplot(2, 3, 2, projection="3d"); surf(ax2, Ph, r"$\Phi$"+title_suffix)
-    ax3 = fig.add_subplot(2, 3, 3, projection="3d"); surf(ax3, Ps, r"$\Psi$"+title_suffix)
-    ax4 = fig.add_subplot(2, 3, 4, projection="3d"); surf(ax4, U1, r"$U_1$"+title_suffix)
-    ax5 = fig.add_subplot(2, 3, 5, projection="3d"); surf(ax5, U2, r"$U_2$"+title_suffix)
+    ax1 = fig.add_subplot(2, 3, 1, projection="3d"); surf(ax1, Omc, r"$\Omega$")
+    ax2 = fig.add_subplot(2, 3, 2, projection="3d"); surf(ax2, Phc, r"$\Phi$")
+    ax3 = fig.add_subplot(2, 3, 3, projection="3d"); surf(ax3, Psc, r"$\Psi$")
+    ax4 = fig.add_subplot(2, 3, 4, projection="3d"); surf(ax4, U1c, r"$U_1$")
+    ax5 = fig.add_subplot(2, 3, 5, projection="3d"); surf(ax5, U2c, r"$U_2$")
     ax6 = fig.add_subplot(2, 3, 6); ax6.axis("off")
-    ax6.text(0.05, 0.6, f"PyTorch solve\nlambda={fields.lam.detach().cpu().item():.6f}", fontsize=16)
+    ax6.text(0.05, 0.6, f"lambda={fields.lam.detach().cpu().item():.6f}", fontsize=16)
 
     plt.tight_layout()
     plt.show()
@@ -479,21 +507,14 @@ def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20), title_suf
 def main():
     torch.set_default_dtype(torch.float64)
 
-    n1, n2 = 257, 129
-    L1, L2 = 60.0, 60.0
-
     fields, grids = solve_torch(
-        n1=n1, n2=n2, L1=L1, L2=L2,
-        adv_scheme="upwind",
+        n1=257, n2=129, L1=60.0, L2=60.0,
+        lam0=3.0, learn_lambda=False,
+        iters=50000, lr=2e-3, print_every=200,
         enforce_reflection_wall=True,
-        max_lbfgs_steps=50000,
-        print_every=50,
-        lam0=1.9,
-        learn_lambda=False,
     )
-
-    print(f"Done. lambda={fields.lam.detach().cpu().item():.12g}")
-    visualize(fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20), title_suffix="")
+    print("Done.")
+    visualize(fields, grids)
 
 
 if __name__ == "__main__":
