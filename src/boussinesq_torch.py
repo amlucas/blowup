@@ -150,27 +150,82 @@ def dy2_upwind(f, W2, h2, s2):
 # ----------------------------
 
 class Fields(torch.nn.Module):
+    """
+    Enforce y1-parity exactly by parameterizing only the y1>=0 half
+    and reflecting with +/- symmetry.
+
+    Odd in y1:  U1, Phi, Omega
+    Even in y1: U2, Psi
+    """
     def __init__(self, n1, n2, init_eps=1e-3, lam0=1.9, device="cpu", dtype=torch.float64):
         super().__init__()
+        assert n1 % 2 == 1, "Need odd n1 so that y1=0 is a gridline."
         self.n1, self.n2 = n1, n2
-        # Store as parameters
-        self.Omega = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
-        self.U1    = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
-        self.U2    = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
-        self.Phi   = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
-        self.Psi   = torch.nn.Parameter(torch.zeros((n1, n2), device=device, dtype=dtype))
-        #self.lam   = torch.nn.Parameter(torch.tensor(float(lam0), device=device, dtype=dtype))
-        self.lam   = torch.tensor(float(lam0), device=device, dtype=dtype)
+        self.i0 = n1 // 2
+        self.n1h = n1 - self.i0  # includes centerline + positive side
 
-        # small random init for U,Phi,Psi
+        # Half-side learnable parameters (y1>=0 side, including centerline)
+        self._Omega_h = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
+        self._U1_h    = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
+        self._U2_h    = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
+        self._Phi_h   = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
+        self._Psi_h   = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
+
+        # lambda: if you want it fixed, keep tensor; if you want it learned, make Parameter.
+        self.lam = torch.tensor(float(lam0), device=device, dtype=dtype)
+
         torch.manual_seed(0)
-        for p in [self.U1, self.U2, self.Phi, self.Psi]:
+        for p in [self._U1_h, self._U2_h, self._Phi_h, self._Psi_h]:
             p.data[:] = init_eps * torch.randn_like(p.data)
 
-def seed_omega_from_y(fields: Fields, Y1, Y2):
-    # same seed you used, but directly in torch
-    fields.Omega.data[:] = -Y1 / (1.0 + Y1**2 + Y2**2)
+        # for odd fields, centerline should be zero -> enforce at init too
+        self._Omega_h.data[0, :] = 0.0
+        self._U1_h.data[0, :]    = 0.0
+        self._Phi_h.data[0, :]   = 0.0
 
+    @staticmethod
+    def _reflect_even(pos):
+        # pos: (n1h, n2) with pos[0] = centerline
+        neg = torch.flip(pos[1:], dims=[0])               # (n1h-1, n2)
+        return torch.cat([neg, pos], dim=0)               # (n1, n2)
+
+    @staticmethod
+    def _reflect_odd(pos):
+        # pos: (n1h, n2) with pos[0] = centerline, must be 0 for odd symmetry
+        neg = torch.flip(pos[1:], dims=[0])               # (n1h-1, n2)
+        center = torch.zeros_like(pos[:1])
+        return torch.cat([-neg, center, pos[1:]], dim=0)  # (n1, n2)
+
+    @property
+    def Omega(self):
+        # odd in y1
+        pos = self._Omega_h.clone()
+        pos[0, :] = 0.0
+        return self._reflect_odd(pos)
+
+    @property
+    def U1(self):
+        # odd in y1
+        pos = self._U1_h.clone()
+        pos[0, :] = 0.0
+        return self._reflect_odd(pos)
+
+    @property
+    def Phi(self):
+        # odd in y1
+        pos = self._Phi_h.clone()
+        pos[0, :] = 0.0
+        return self._reflect_odd(pos)
+
+    @property
+    def U2(self):
+        # even in y1
+        return self._reflect_even(self._U2_h)
+
+    @property
+    def Psi(self):
+        # even in y1
+        return self._reflect_even(self._Psi_h)
 
 # ----------------------------
 # Loss assembly
@@ -335,10 +390,10 @@ def solve_torch(
     masks = make_masks(n1, n2, device=device)
 
     fields = Fields(n1, n2, init_eps=1e-3, lam0=lam0, device=device, dtype=dtype)
-    seed_omega_from_y(fields, Y1, Y2)
+    #seed_omega_from_y(fields, Y1, Y2)
 
     # weights (tune these)
-    weights = {"pde": 1.0, "gauge": 100.0, "wall": 10.0, "far": 10.0}
+    weights = {"pde": 1.0, "gauge": 100.0, "wall": 10.0, "far": 0.0}
 
     # LBFGS usually works best for these PDE residual minimizations
     opt = torch.optim.LBFGS(
@@ -438,14 +493,15 @@ def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20), title_suf
 def main():
     torch.set_default_dtype(torch.float64)
 
-    n1, n2 = 513, 257
+    #n1, n2 = 513, 257
+    n1, n2 = 257, 129
     L1, L2 = 60.0, 60.0
 
     fields, grids = solve_torch(
         n1=n1, n2=n2, L1=L1, L2=L2,
         adv_scheme="upwind",              # try "central" to compare
         enforce_reflection_wall=True,
-        max_lbfgs_steps=10000,
+        max_lbfgs_steps=5000,
         print_every=50,
         lam0=3.0
     )
