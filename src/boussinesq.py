@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import os
 import math
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+
 
 
 # ----------------------------
@@ -82,18 +84,18 @@ class Fields(torch.nn.Module):
       Phi: centers (n1,n2)    odd in y1
       Psi: centers (n1,n2)    even in y1
     """
-    def __init__(self, n1, n2, lam0=1.9, init_eps=1e-3, device="cpu", dtype=torch.float64, learn_lambda=False):
+    def __init__(self, n1, n2, lam0=1.9, device="cpu", dtype=torch.float64, learn_lambda=False, seed=0):
         super().__init__()
         assert n1 % 2 == 1
         self.n1, self.n2 = n1, n2
         self.i0 = n1 // 2
 
         # number of positive x-faces (strictly y1>0): since faces count is n1+1 even, half is (n1+1)/2
-        self.nx_pos = (n1 + 1) // 2          # 129 for n1=257
-        self.ic0f = self.nx_pos              # first positive-face index in full array
+        self.nx_pos = (n1 + 1) // 2
+        self.ic0f = self.nx_pos
 
-        # number of positive centers including centerline: n1 - i0
-        self.n1h = n1 - self.i0              # 129 for n1=257
+        # number of positive centers including centerline
+        self.n1h = n1 - self.i0
 
         # half parameters
         self._U1x_p = torch.nn.Parameter(torch.zeros((self.nx_pos, n2), device=device, dtype=dtype))
@@ -106,14 +108,8 @@ class Fields(torch.nn.Module):
         else:
             self.lam = torch.tensor(float(lam0), device=device, dtype=dtype)
 
-        torch.manual_seed(0)
-        for p in [self._U1x_p, self._U2y_h, self._Phi_h, self._Psi_h]:
-            p.data[:] = init_eps * torch.randn_like(p.data)
-
         # odd centerline at centers:
         self._Phi_h.data[0, :] = 0.0
-
-        # For U1x there is no face at y1=0. Don’t force any special row to 0 here.
 
     @staticmethod
     def _reflect_even_centers(pos):
@@ -128,13 +124,11 @@ class Fields(torch.nn.Module):
 
     @staticmethod
     def _reflect_even_faces(pos):
-        # full = [flip(pos), pos], no shared center face
         neg = torch.flip(pos, dims=[0])
         return torch.cat([neg, pos], dim=0)
 
     @staticmethod
     def _reflect_odd_faces(pos):
-        # full = [-flip(pos), pos], no shared center face
         neg = torch.flip(pos, dims=[0])
         return torch.cat([-neg, pos], dim=0)
 
@@ -162,7 +156,6 @@ class Fields(torch.nn.Module):
 # ----------------------------
 
 def grad_bwd_y1_center(qc, dy1_c):
-    # qc (n1,n2), dy1_c (n1,)
     out = torch.empty_like(qc)
     out[1:, :] = (qc[1:, :] - qc[:-1, :]) / (0.5*(dy1_c[1:, None] + dy1_c[:-1, None]))
     out[0, :]  = (qc[1, :] - qc[0, :]) / dy1_c[0]
@@ -181,7 +174,6 @@ def grad_bwd_y2_center(qc, dy2_c):
 # ----------------------------
 
 def div_U(U1x, U2y, dy1_c, dy2_c):
-    # U1x (n1+1,n2) -> diff gives (n1,n2), divide by dy1_c
     d1 = (U1x[1:, :] - U1x[:-1, :]) / dy1_c[:, None]
     d2 = (U2y[:, 1:] - U2y[:, :-1]) / dy2_c[None, :]
     return d1 + d2
@@ -306,7 +298,7 @@ def loss_total(fields: Fields, grids, masks, weights, enforce_reflection_wall=Tr
         mse_mask(res["R_comp"], interior)
     )
 
-    # gauge at (y1=0,y2=0): use centerline i0 and neighbor i0+1, j=0
+    # gauge at (y1=0,y2=0)
     i0 = fields.i0
     j0 = 0
     dy1_c = grids["dy1_c"]
@@ -327,7 +319,7 @@ def loss_total(fields: Fields, grids, masks, weights, enforce_reflection_wall=Tr
         # Psi=0 at wall centers
         L_wall = L_wall + mse_mask(Psi, wall_centers)
 
-        # d_y2 Phi = 0 and d_y2 Omega = 0 at wall centers (forward difference)
+        # d_y2 Phi = 0 and d_y2 Omega = 0 at wall centers (forward)
         dy2_c = grids["dy2_c"]
         dy2_between = 0.5 * (dy2_c[0] + dy2_c[1])
         dPhi_dy2_wall = (Phi[:, 1] - Phi[:, 0]) / dy2_between
@@ -418,6 +410,7 @@ def solve_torch(
     device=None, dtype=torch.float64,
     iters=20000, lr=2e-3, print_every=200,
     enforce_reflection_wall=True,
+    seed=0,
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -425,7 +418,7 @@ def solve_torch(
     grids = make_grids(n1, n2, L1, L2, device=device, dtype=dtype)
     masks = make_masks(n1, n2, device=device)
 
-    fields = Fields(n1, n2, lam0=lam0, init_eps=1e-3, device=device, dtype=dtype, learn_lambda=learn_lambda)
+    fields = Fields(n1, n2, lam0=lam0, device=device, dtype=dtype, learn_lambda=learn_lambda, seed=seed)
     init_fields(fields, grids)
 
     weights = {"pde": 50.0, "gauge": 10.0, "wall": 10.0, "far": 50.0}
@@ -451,7 +444,35 @@ def solve_torch(
 
 
 # ----------------------------
-# Viz
+# IO helpers (GPU-safe)
+# ----------------------------
+
+@torch.no_grad()
+def export_npz(path, fields, grids):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    dy1_c = grids["dy1_c"]
+    dy2_c = grids["dy2_c"]
+
+    U1x = fields.U1x
+    U2y = fields.U2y
+    Om, U1c, U2c, _, _ = omega_center(U1x, U2y, dy1_c, dy2_c)
+
+    np.savez_compressed(
+        path,
+        lam=float(fields.lam.detach().cpu().item()),
+        y1_c=grids["y1_c"].detach().cpu().numpy(),
+        y2_c=grids["y2_c"].detach().cpu().numpy(),
+        Omega=Om.detach().cpu().numpy(),
+        U1=U1c.detach().cpu().numpy(),
+        U2=U2c.detach().cpu().numpy(),
+        Phi=fields.Phi.detach().cpu().numpy(),
+        Psi=fields.Psi.detach().cpu().numpy(),
+    )
+
+
+# ----------------------------
+# Viz (CPU only)
 # ----------------------------
 
 def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20)):
@@ -462,6 +483,9 @@ def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20)):
 
     I = np.where((y1_c >= y1_lim[0]) & (y1_c <= y1_lim[1]))[0]
     J = np.where((y2_c >= y2_lim[0]) & (y2_c <= y2_lim[1]))[0]
+    if I.size < 3 or J.size < 3:
+        print("Visualization window too small; adjust y1_lim/y2_lim.")
+        return
 
     def crop_center(T):
         A = T.detach().cpu().numpy()
@@ -498,22 +522,36 @@ def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20)):
     ax4 = fig.add_subplot(2, 3, 4, projection="3d"); surf(ax4, U1c, r"$U_1$")
     ax5 = fig.add_subplot(2, 3, 5, projection="3d"); surf(ax5, U2c, r"$U_2$")
     ax6 = fig.add_subplot(2, 3, 6); ax6.axis("off")
-    ax6.text(0.05, 0.6, f"lambda={fields.lam.detach().cpu().item():.6f}", fontsize=16)
+    ax6.text(0.05, 0.6, f"lambda={float(fields.lam.detach().cpu().item()):.6f}", fontsize=16)
 
     plt.tight_layout()
-    plt.show()
+    plt.savefig('views.png')
 
 
 def main():
     torch.set_default_dtype(torch.float64)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    level = 7
+    n1 = 2**(level + 1) + 1
+    n2 = 2**level + 1
+
+    print(f"n1, n2 = {n1}, {n2}")
+
     fields, grids = solve_torch(
-        n1=257, n2=129, L1=60.0, L2=60.0,
-        lam0=3.0, learn_lambda=False,
-        iters=50000, lr=2e-3, print_every=200,
+        n1=n1, n2=n2,
+        L1=60.0, L2=60.0,
+        lam0=3.0,
+        device=device,
+        dtype=torch.float64,
+        learn_lambda=False,
+        iters=100000, lr=2e-3, print_every=200,
         enforce_reflection_wall=True,
+        seed=0,
     )
     print("Done.")
+    export_npz("runs/boussinesq/solution.npz", fields, grids)
     visualize(fields, grids)
 
 
