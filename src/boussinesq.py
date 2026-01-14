@@ -19,6 +19,92 @@ def open_loss_csv(csv_path, fieldnames):
     f.flush()
     return f, w
 
+import torch.nn as nn
+
+def interp1d_along_axis(u, bc, target_n, axis):
+    device = u.device
+    old_n = u.shape[axis]
+
+    if old_n == 1 and bc == "n":
+        return u.expand(*u.shape[:axis], target_n, *u.shape[axis + 1:])
+
+    x_old = torch.linspace(0, 1, old_n, device=device)
+    x_new = torch.linspace(0, 1, target_n, device=device)
+
+    if bc == "p":
+        x_old = torch.cat([x_old, torch.tensor([1.0], device=device)])
+        u = torch.cat([u, u.index_select(axis, torch.tensor([0], device=device))], dim=axis)
+        old_n += 1
+
+    idx_left = torch.searchsorted(x_old, x_new) - 1
+    idx_left = idx_left.clamp(0, old_n - 2)
+    idx_right = idx_left + 1
+
+    x0 = x_old[idx_left]
+    x1 = x_old[idx_right]
+    w = (x_new - x0) / (x1 - x0 + 1e-12)
+
+    shape_w = [1] * u.ndim
+    shape_w[axis] = -1
+    w = w.view(shape_w)
+
+    index_shape = [1] * u.ndim
+    index_shape[axis] = -1
+    idxL = idx_left.view(index_shape).expand(*u.shape[:axis], target_n, *u.shape[axis + 1:])
+    idxR = idx_right.view(index_shape).expand_as(idxL)
+
+    left_vals = torch.take_along_dim(u, idxL, dim=axis)
+    right_vals = torch.take_along_dim(u, idxR, dim=axis)
+    return left_vals * (1 - w) + right_vals * w
+
+
+def upscale_grid(u, bc, target_shape):
+    assert len(bc) == u.ndim
+    assert len(target_shape) == u.ndim
+    uf = u
+    for axis, (b, n_new) in enumerate(zip(bc, target_shape)):
+        if uf.shape[axis] != n_new:
+            uf = interp1d_along_axis(uf, b, n_new, axis)
+    return uf
+
+
+class MultigridParam(nn.Module):
+    """
+    Learnable multigrid hierarchy:
+      full = sum_{l=0..depth} prolong(level[l]) where level[0] is finest residual.
+    """
+    def __init__(self, shape, bc="nn", depth=2, device="cpu", dtype=torch.float64):
+        super().__init__()
+        assert len(shape) == len(bc)
+        self.bc = bc
+        self.depth = depth
+
+        shapes = [tuple(shape)]
+        s = list(shape)
+        for _ in range(depth):
+            for i, b in enumerate(bc):
+                if b == "n":
+                    s[i] = max(1, (s[i] + 1) // 2)
+                else:  # periodic
+                    s[i] = max(1, s[i] // 2)
+            shapes.append(tuple(s))
+
+        # level[0]=finest, level[-1]=coarsest
+        self.levels = nn.ParameterList([
+            nn.Parameter(torch.zeros(sh, device=device, dtype=dtype)) for sh in shapes
+        ])
+
+    def set_finest(self, tensor):
+        with torch.no_grad():
+            self.levels[0].copy_(tensor)
+            for l in range(1, len(self.levels)):
+                self.levels[l].zero_()
+
+    def get(self):
+        u = self.levels[-1]
+        for sub in self.levels[-2::-1]:
+            u = upscale_grid(u, self.bc, sub.shape) + sub
+        return u
 
 # ----------------------------
 # Grids: centers + faces in y
@@ -97,7 +183,7 @@ class Fields(torch.nn.Module):
       Phi: centers (n1,n2)    odd in y1
       Psi: centers (n1,n2)    even in y1
     """
-    def __init__(self, n1, n2, lam0=1.9, device="cpu", dtype=torch.float64, learn_lambda=False, seed=0):
+    def __init__(self, n1, n2, lam0=1.9, device="cpu", dtype=torch.float64, learn_lambda=False, mg_depth=6):
         super().__init__()
         assert n1 % 2 == 1
         self.n1, self.n2 = n1, n2
@@ -111,18 +197,18 @@ class Fields(torch.nn.Module):
         self.n1h = n1 - self.i0
 
         # half parameters
-        self._U1x_p = torch.nn.Parameter(torch.zeros((self.nx_pos, n2), device=device, dtype=dtype))
-        self._U2y_h = torch.nn.Parameter(torch.zeros((self.n1h, n2+1), device=device, dtype=dtype))
-        self._Phi_h = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
-        self._Psi_h = torch.nn.Parameter(torch.zeros((self.n1h, n2), device=device, dtype=dtype))
+        bc2 = "nn"  # nonperiodic both axes
+
+        self._U1x_p_mg = MultigridParam((self.nx_pos, n2),   bc=bc2, depth=mg_depth, device=device, dtype=dtype)
+        self._U2y_h_mg = MultigridParam((self.n1h,  n2+1),   bc=bc2, depth=mg_depth, device=device, dtype=dtype)
+        self._Phi_h_mg = MultigridParam((self.n1h,  n2),     bc=bc2, depth=mg_depth, device=device, dtype=dtype)
+        self._Psi_h_mg = MultigridParam((self.n1h,  n2),     bc=bc2, depth=mg_depth, device=device, dtype=dtype)
 
         if learn_lambda:
             self.lam = torch.nn.Parameter(torch.tensor(float(lam0), device=device, dtype=dtype))
         else:
             self.lam = torch.tensor(float(lam0), device=device, dtype=dtype)
 
-        # odd centerline at centers:
-        self._Phi_h.data[0, :] = 0.0
 
     @staticmethod
     def _reflect_even_centers(pos):
@@ -147,22 +233,21 @@ class Fields(torch.nn.Module):
 
     @property
     def Phi(self):
-        pos = self._Phi_h.clone()
+        pos = self._Phi_h_mg.get().clone()
         pos[0, :] = 0.0
         return self._reflect_odd_centers(pos)
 
     @property
     def Psi(self):
-        return self._reflect_even_centers(self._Psi_h)
+        return self._reflect_even_centers(self._Psi_h_mg.get())
 
     @property
     def U2y(self):
-        return self._reflect_even_centers(self._U2y_h)
+        return self._reflect_even_centers(self._U2y_h_mg.get())
 
     @property
     def U1x(self):
-        return self._reflect_odd_faces(self._U1x_p)
-
+        return self._reflect_odd_faces(self._U1x_p_mg.get())
 
 # ----------------------------
 # FV one-sided gradients on centers
@@ -410,11 +495,10 @@ def init_fields(fields: Fields, grids, R1=20.0, R2=20.0, d1=2.0, d2=2.0):
     # pack into half
     i0 = fields.i0
     ic0f = fields.ic0f
-    fields._U1x_p.data[:] = U1x_full[ic0f:, :].clone()
-    fields._U2y_h.data[:] = U2y_full[i0:, :].clone()
-    fields._Phi_h.data.zero_()
-    fields._Psi_h.data.zero_()
-    fields._Phi_h.data[0, :] = 0.0
+    fields._U1x_p_mg.set_finest(U1x_full[ic0f:, :].clone())
+    fields._U2y_h_mg.set_finest(U2y_full[i0:, :].clone())
+    fields._Phi_h_mg.set_finest(torch.zeros_like(fields._Phi_h_mg.levels[0]))
+    fields._Psi_h_mg.set_finest(torch.zeros_like(fields._Psi_h_mg.levels[0]))
 
 
 # ----------------------------
@@ -454,28 +538,16 @@ def export_npz(path, fields, grids, it=None):
 # Main loop
 # ----------------------------
 
-# --- add/replace in your script: LBFGS phase after Adam ---
-
 def solve_torch(
     n1=257, n2=129, L1=60.0, L2=60.0,
     lam0=1.9, learn_lambda=False,
     device=None, dtype=torch.float64,
     iters=20000, lr=2e-3, print_every=200,
     enforce_reflection_wall=True,
-    seed=0,
     csv_path="loss.csv",
     log_every=1,
     out_dir="runs/boussinesq",
     save_every=10_000,
-    # NEW:
-    adam_iters=50_000,
-    lbfgs_iters=50_000,
-    lbfgs_lr=1.0,
-    lbfgs_max_iter=20,
-    lbfgs_history_size=50,
-    lbfgs_tol_grad=1e-10,
-    lbfgs_tol_change=1e-12,
-    lbfgs_line_search="strong_wolfe",
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -483,7 +555,7 @@ def solve_torch(
     grids = make_grids(n1, n2, L1, L2, device=device, dtype=dtype)
     masks = make_masks(n1, n2, device=device)
 
-    fields = Fields(n1, n2, lam0=lam0, device=device, dtype=dtype, learn_lambda=learn_lambda, seed=seed)
+    fields = Fields(n1, n2, lam0=lam0, device=device, dtype=dtype, learn_lambda=learn_lambda)
     init_fields(fields, grids)
 
     weights = {"pde": 100.0, "gauge": 1.0, "wall": 50.0, "far": 5.0}
@@ -508,12 +580,9 @@ def solve_torch(
     it_global = 0
 
     try:
-        # ----------------
-        # Phase 1: Adam
-        # ----------------
         opt = torch.optim.Adam(fields.parameters(), lr=lr)
 
-        for k in range(1, adam_iters + 1):
+        for k in range(1, iters + 1):
             it_global += 1
             opt.zero_grad(set_to_none=True)
             L, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
@@ -529,58 +598,6 @@ def solve_torch(
             if it_global % print_every == 0 or it_global == 1:
                 print(
                     f"[adam  {it_global:06d}] "
-                    f"L={stats['L']:.3e}  L_pde={stats['L_pde']:.3e}  "
-                    f"L_g={stats['L_g']:.3e}  L_wall={stats['L_wall']:.3e}  L_far={stats['L_far']:.3e}  "
-                    f"dy1Om00={stats['dy1Om00']:.6f}  lam={stats['lam']:.6f}  lr={lr_now:.2e}"
-                )
-
-            maybe_save(it_global)
-
-        # Save right before LBFGS starts
-        export_npz(os.path.join(out_dir, "pre_lbfgs.npz"), fields, grids, it=it_global)
-
-        # ----------------
-        # Phase 2: LBFGS
-        # ----------------
-        lbfgs = torch.optim.LBFGS(
-            fields.parameters(),
-            lr=lbfgs_lr,
-            max_iter=lbfgs_max_iter,          # inner iterations per .step()
-            history_size=lbfgs_history_size,
-            tolerance_grad=lbfgs_tol_grad,
-            tolerance_change=lbfgs_tol_change,
-            line_search_fn=lbfgs_line_search,
-        )
-
-        last = {"stats": None, "loss": None}
-
-        def closure():
-            lbfgs.zero_grad(set_to_none=True)
-            L, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
-            L.backward()
-            last["stats"] = stats
-            last["loss"] = L
-            return L
-
-        for k in range(1, lbfgs_iters + 1):
-            it_global += 1
-
-            # One "outer" LBFGS step (will call closure multiple times internally)
-            lbfgs.step(closure)
-
-            stats = last["stats"]
-            if stats is None:
-                # extremely unlikely, but keep it safe
-                _, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
-
-            lr_now = lbfgs.param_groups[0]["lr"]
-
-            if (it_global % log_every) == 0:
-                log_row(it_global, "lbfgs", lr_now, stats)
-
-            if it_global % print_every == 0 or it_global == (adam_iters + 1):
-                print(
-                    f"[lbfgs {it_global:06d}] "
                     f"L={stats['L']:.3e}  L_pde={stats['L_pde']:.3e}  "
                     f"L_g={stats['L_g']:.3e}  L_wall={stats['L_wall']:.3e}  L_far={stats['L_far']:.3e}  "
                     f"dy1Om00={stats['dy1Om00']:.6f}  lam={stats['lam']:.6f}  lr={lr_now:.2e}"
@@ -678,17 +695,13 @@ def main():
         dtype=torch.float64,
         learn_lambda=False,
         enforce_reflection_wall=True,
-        seed=0,
         csv_path="out_boussinesq/loss.csv",
         out_dir="out_boussinesq",
         save_every=10_000,
         log_every=1,
         print_every=200,
-        adam_iters=20_000,
-        lbfgs_iters=50_000,
+        iters=50_000,
         lr=2e-3,
-        lbfgs_lr=1.0,
-        lbfgs_max_iter=20,
     )
     print("Done.")
 
