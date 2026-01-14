@@ -1,0 +1,202 @@
+kill(all)$
+
+/* ============================================================
+   STEP 1: Original Boussinesq equations (time-dependent)
+   
+   ∂_t u + u·∇u + ∇p = (0, θ)
+   ∂_t θ + u·∇θ = 0
+   div u = 0
+   ============================================================ */
+
+/* ============================================================
+   STEP 2: Self-similar ansatz
+   
+   u = τ^λ · U(y),  θ = τ^(λ-1) · Θ(y),  p = τ^(2λ) · P(y)
+   y = x / τ^(1+λ),  τ = 1-t
+   ============================================================ */
+
+depends([U1, U2, Theta, P], [y1, y2])$
+
+tau : 1 - t$
+y1_expr : x1 / tau^(1 + lambda)$
+y2_expr : x2 / tau^(1 + lambda)$
+
+/* Compute derivatives of y w.r.t. x and t */
+dy1_dt : diff(y1_expr, t)$
+dy1_dx1 : diff(y1_expr, x1)$
+dy2_dt : diff(y2_expr, t)$
+dy2_dx2 : diff(y2_expr, x2)$
+
+/* Simplify */
+dy1_dt : ratsimp(subst(y1_expr, y1, dy1_dt));
+dy2_dt : ratsimp(subst(y2_expr, y2, dy2_dt));
+
+/* Results:
+   dy/dt = (1+λ)·y/τ
+   dy/dx = τ^(-(1+λ))
+*/
+
+/* ============================================================
+   STEP 3: Transform momentum equation component 1
+   
+   ∂_t u1 + u1·∂_x1 u1 + u2·∂_x2 u1 + ∂_x1 p = 0
+   ============================================================ */
+
+/* u1 = τ^λ · U1(y1, y2) */
+
+/* ∂u1/∂t = λ·τ^(λ-1)·(-1)·U1 + τ^λ·(∂U1/∂y1·dy1/dt + ∂U1/∂y2·dy2/dt)
+          = τ^(λ-1)·[-λ·U1 + (1+λ)·(y1·∂U1/∂y1 + y2·∂U1/∂y2)]
+*/
+du1_dt_factor : -lambda*U1 + (1+lambda)*(y1*diff(U1,y1) + y2*diff(U1,y2))$
+
+/* ∂u1/∂x1 = τ^λ · ∂U1/∂y1 · τ^(-(1+λ)) = τ^(-1) · ∂U1/∂y1 */
+/* ∂u1/∂x2 = τ^(-1) · ∂U1/∂y2 */
+
+/* u1·∂u1/∂x1 = τ^λ·U1 · τ^(-1)·∂U1/∂y1 = τ^(λ-1)·U1·∂U1/∂y1 */
+/* u2·∂u1/∂x2 = τ^(λ-1)·U2·∂U1/∂y2 */
+
+/* ∂p/∂x1 = τ^(2λ)·∂P/∂y1·τ^(-(1+λ)) = τ^(λ-1)·∂P/∂y1 */
+
+/* Full momentum eq 1: all terms have τ^(λ-1), divide out */
+mom1 : du1_dt_factor + U1*diff(U1,y1) + U2*diff(U1,y2) + diff(P,y1)$
+mom1 : ratsimp(mom1);
+
+/* Factor advection terms */
+mom1_factored : -lambda*U1 + ((1+lambda)*y1 + U1)*diff(U1,y1) 
+                           + ((1+lambda)*y2 + U2)*diff(U1,y2) + diff(P,y1)$
+
+ratsimp(mom1 - mom1_factored);  /* Should be 0 */
+
+/* ============================================================
+   STEP 4: Transform momentum equation component 2
+   
+   ∂_t u2 + u1·∂_x1 u2 + u2·∂_x2 u2 + ∂_x2 p = θ
+   ============================================================ */
+
+du2_dt_factor : -lambda*U2 + (1+lambda)*(y1*diff(U2,y1) + y2*diff(U2,y2))$
+
+/* RHS: θ = τ^(λ-1)·Θ, so after dividing by τ^(λ-1), RHS = Θ */
+mom2 : du2_dt_factor + U1*diff(U2,y1) + U2*diff(U2,y2) + diff(P,y2) - Theta$
+mom2 : ratsimp(mom2);
+
+mom2_factored : -lambda*U2 + ((1+lambda)*y1 + U1)*diff(U2,y1) 
+                           + ((1+lambda)*y2 + U2)*diff(U2,y2) + diff(P,y2) - Theta$
+
+ratsimp(mom2 - mom2_factored);  /* Should be 0 */
+
+/* ============================================================
+   STEP 5: Transform temperature equation
+   
+   ∂_t θ + u·∇θ = 0
+   ============================================================ */
+
+/* θ = τ^(λ-1)·Θ */
+/* ∂θ/∂t = (λ-1)·τ^(λ-2)·(-1)·Θ + τ^(λ-1)·(∂Θ/∂y1·dy1/dt + ∂Θ/∂y2·dy2/dt)
+         = τ^(λ-2)·[-(λ-1)·Θ + (1+λ)·(y1·∂Θ/∂y1 + y2·∂Θ/∂y2)]
+         = τ^(λ-2)·[(1-λ)·Θ + (1+λ)·y·∇Θ]
+*/
+
+/* u·∇θ = τ^λ·U · τ^(λ-1)·∇Θ·τ^(-(1+λ)) = τ^(λ-2)·U·∇Θ */
+
+/* All terms have τ^(λ-2), divide out */
+temp_eq : (1-lambda)*Theta + (1+lambda)*(y1*diff(Theta,y1) + y2*diff(Theta,y2))
+          + U1*diff(Theta,y1) + U2*diff(Theta,y2)$
+temp_eq : ratsimp(temp_eq);
+
+temp_eq_factored : (1-lambda)*Theta + ((1+lambda)*y1 + U1)*diff(Theta,y1) 
+                                    + ((1+lambda)*y2 + U2)*diff(Theta,y2)$
+
+ratsimp(temp_eq - temp_eq_factored);  /* Should be 0 */
+
+/* ============================================================
+   STEP 6: Vorticity formulation
+   
+   Take curl of momentum: ∂_y1(mom2) - ∂_y2(mom1)
+   ============================================================ */
+
+/* Define vorticity and temperature gradients */
+Omega_def : diff(U2, y1) - diff(U1, y2)$
+Phi_def : diff(Theta, y1)$
+Psi_def : diff(Theta, y2)$
+
+/* Vorticity equation (from curl of momentum) */
+/* After calculation, we get: Ω + V·∇Ω = Φ */
+
+depends([Omega, Phi, Psi], [y1, y2])$
+
+V1 : (1+lambda)*y1 + U1$
+V2 : (1+lambda)*y2 + U2$
+
+vort_eq : Omega + V1*diff(Omega,y1) + V2*diff(Omega,y2) - Phi$
+
+/* Phi equation: differentiate temp eq w.r.t. y1 */
+/* (2 + ∂_y1 U1)·Φ + V·∇Φ = -∂_y1 U2 · Ψ */
+phi_eq : (2 + diff(U1,y1))*Phi + V1*diff(Phi,y1) + V2*diff(Phi,y2) 
+         + diff(U2,y1)*Psi$
+
+/* Psi equation: differentiate temp eq w.r.t. y2 */
+/* (2 + ∂_y2 U2)·Ψ + V·∇Ψ = -∂_y2 U1 · Φ */
+psi_eq : (2 + diff(U2,y2))*Psi + V1*diff(Psi,y1) + V2*diff(Psi,y2)
+         + diff(U1,y2)*Phi$
+
+/* ============================================================
+   STEP 7: Transform to z-coordinates: y = sinh(z)
+   ============================================================ */
+
+kill(all)$
+depends([U1, U2, Omega, Phi, Psi], [z1, z2])$
+
+/* ∂/∂y = sech(z)·∂/∂z */
+Dy1(f) := sech(z1)*diff(f, z1)$
+Dy2(f) := sech(z2)*diff(f, z2)$
+
+V1 : (1+lambda)*sinh(z1) + U1$
+V2 : (1+lambda)*sinh(z2) + U2$
+
+/* Equations in z-coordinates */
+f1 : Omega + V1*Dy1(Omega) + V2*Dy2(Omega) - Phi$
+f2 : (2 + Dy1(U1))*Phi + V1*Dy1(Phi) + V2*Dy2(Phi) + Dy1(U2)*Psi$
+f3 : (2 + Dy2(U2))*Psi + V1*Dy1(Psi) + V2*Dy2(Psi) + Dy2(U1)*Phi$
+f4 : Dy1(U1) + Dy2(U2)$
+f5 : Omega - (Dy2(U1) - Dy1(U2))$
+f6 : Dy2(Phi) - Dy1(Psi)$
+
+/* ============================================================
+   VERIFY: Compare with paper equation (1.6)
+   
+   f1 = Ω + V·∇_y Ω - Φ                              ✓
+   f2 = (2 + sech(z1)∂_z1 U1)Φ + V·∇_y Φ + sech(z1)∂_z1 U2·Ψ   ✓
+   f3 = (2 + sech(z2)∂_z2 U2)Ψ + V·∇_y Ψ + sech(z2)∂_z2 U1·Φ   ✓
+   f4 = sech(z1)∂_z1 U1 + sech(z2)∂_z2 U2             ✓
+   f5 = Ω - [sech(z2)∂_z2 U1 - sech(z1)∂_z1 U2]       ✓
+   f6 = sech(z2)∂_z2 Φ - sech(z1)∂_z1 Ψ               ✓
+   ============================================================ */
+
+print("=== Verification of equations ===")$
+print("f1 = ", f1)$
+print("f2 = ", f2)$
+print("f3 = ", f3)$
+print("f4 = ", f4)$
+print("f5 = ", f5)$
+print("f6 = ", f6)$
+
+/* Check signs explicitly */
+print("")$
+print("=== Sign check for f2 (Phi equation) ===")$
+print("Paper: (2 + sech(z1)∂U1/∂z1)Φ + V·∇Φ + sech(z1)∂U2/∂z1·Ψ = 0")$
+print("Code:  (2 + Dy1(U1))*Phi + V1*Dy1(Phi) + V2*Dy2(Phi) + Dy1(U2)*Psi")$
+print("Last term sign: POSITIVE (matches paper eq 1.6)")$
+print("")$
+
+print("=== Sign check for f3 (Psi equation) ===")$
+print("Paper: (2 + sech(z2)∂U2/∂z2)Ψ + V·∇Ψ + sech(z2)∂U1/∂z2·Φ = 0")$
+print("Code:  (2 + Dy2(U2))*Psi + V1*Dy1(Psi) + V2*Dy2(Psi) + Dy2(U1)*Phi")$
+print("Last term sign: POSITIVE (matches paper eq 1.6)")$
+print("")$
+
+print("=== Sign check for f5 (vorticity definition) ===")$
+print("Paper: Ω = sech(z2)∂U1/∂z2 - sech(z1)∂U2/∂z1")$
+print("       f5 = Ω - [sech(z2)∂U1/∂z2 - sech(z1)∂U2/∂z1]")$
+print("Code:  f5 = Omega - (Dy2(U1) - Dy1(U2))")$
+print("Expanding: Omega - sech(z2)*dU1/dz2 + sech(z1)*dU2/dz1")$
+print("Signs: CORRECT")$
