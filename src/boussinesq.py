@@ -444,7 +444,7 @@ def solve_torch(
 
 
 # ----------------------------
-# IO helpers (GPU-safe)
+# IO helpers
 # ----------------------------
 
 @torch.no_grad()
@@ -472,10 +472,14 @@ def export_npz(path, fields, grids):
 
 
 # ----------------------------
-# Viz (CPU only)
+# Viz
 # ----------------------------
 
-def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20)):
+def visualize(fields: Fields,
+              grids,
+              y1_lim=(-20, 20),
+              y2_lim=(0, 20),
+              path=None):
     y1_c = grids["y1_c"].detach().cpu().numpy()
     y2_c = grids["y2_c"].detach().cpu().numpy()
     Y1c = grids["Y1c"].detach().cpu().numpy()
@@ -525,7 +529,10 @@ def visualize(fields: Fields, grids, y1_lim=(-20, 20), y2_lim=(0, 20)):
     ax6.text(0.05, 0.6, f"lambda={float(fields.lam.detach().cpu().item()):.6f}", fontsize=16)
 
     plt.tight_layout()
-    plt.savefig('views.png')
+    if path is None:
+        plt.show()
+    else:
+        plt.savefig(path)
 
 
 def main():
