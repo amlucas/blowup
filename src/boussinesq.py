@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
+import csv
 import os
 import math
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
+import time
 
+def open_loss_csv(csv_path, fieldnames):
+    csv_path = os.path.expanduser(csv_path)
+    dirpath = os.path.dirname(csv_path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+
+    f = open(csv_path, "w", newline="")
+    w = csv.DictWriter(f, fieldnames=fieldnames)
+    w.writeheader()
+    f.flush()
+    return f, w
 
 
 # ----------------------------
@@ -401,6 +414,39 @@ def init_fields(fields: Fields, grids, R1=20.0, R2=20.0, d1=2.0, d2=2.0):
 
 
 # ----------------------------
+# IO helpers
+# ----------------------------
+
+@torch.no_grad()
+def export_npz(path, fields, grids, it=None):
+    path = os.path.expanduser(path)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+
+    dy1_c = grids["dy1_c"]
+    dy2_c = grids["dy2_c"]
+
+    U1x = fields.U1x
+    U2y = fields.U2y
+    Om, U1c, U2c, _, _ = omega_center(U1x, U2y, dy1_c, dy2_c)
+
+    payload = dict(
+        lam=float(fields.lam.detach().cpu().item()),
+        y1_c=grids["y1_c"].detach().cpu().numpy(),
+        y2_c=grids["y2_c"].detach().cpu().numpy(),
+        Omega=Om.detach().cpu().numpy(),
+        U1=U1c.detach().cpu().numpy(),
+        U2=U2c.detach().cpu().numpy(),
+        Phi=fields.Phi.detach().cpu().numpy(),
+        Psi=fields.Psi.detach().cpu().numpy(),
+    )
+    if it is not None:
+        payload["it"] = int(it)
+
+    np.savez_compressed(path, **payload)
+
+# ----------------------------
 # Solve (Adam)
 # ----------------------------
 
@@ -411,6 +457,10 @@ def solve_torch(
     iters=20000, lr=2e-3, print_every=200,
     enforce_reflection_wall=True,
     seed=0,
+    csv_path="loss.csv",
+    log_every=1,
+    out_dir="runs/boussinesq",
+    save_every=10_000,
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -422,53 +472,49 @@ def solve_torch(
     init_fields(fields, grids)
 
     weights = {"pde": 50.0, "gauge": 10.0, "wall": 10.0, "far": 50.0}
-
     opt = torch.optim.Adam(fields.parameters(), lr=lr)
 
-    for it in range(1, iters + 1):
-        opt.zero_grad(set_to_none=True)
-        L, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
-        L.backward()
-        torch.nn.utils.clip_grad_norm_(fields.parameters(), max_norm=10.0)
-        opt.step()
+    fieldnames = ["it", "time_s", "lr", "L", "L_pde", "L_g", "L_wall", "L_far", "dy1Om00", "lam"]
+    t0 = time.time()
+    csv_f, csv_w = open_loss_csv(csv_path, fieldnames)
 
-        if it % print_every == 0 or it == 1:
-            print(
-                f"[adam {it:06d}] "
-                f"L={stats['L']:.3e}  L_pde={stats['L_pde']:.3e}  "
-                f"L_g={stats['L_g']:.3e}  L_wall={stats['L_wall']:.3e}  L_far={stats['L_far']:.3e}  "
-                f"dy1Om00={stats['dy1Om00']:.6f}  lam={stats['lam']:.6f}"
-            )
+    out_dir = os.path.expanduser(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        for it in range(1, iters + 1):
+            opt.zero_grad(set_to_none=True)
+            L, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
+            L.backward()
+            torch.nn.utils.clip_grad_norm_(fields.parameters(), max_norm=10.0)
+            opt.step()
+
+            lr_now = opt.param_groups[0]["lr"]
+
+            if (it % log_every) == 0:
+                row = {"it": it, "time_s": time.time() - t0, "lr": lr_now, **stats}
+                csv_w.writerow(row)
+                csv_f.flush()
+
+            if it % print_every == 0 or it == 1:
+                print(
+                    f"[adam {it:06d}] "
+                    f"L={stats['L']:.3e}  L_pde={stats['L_pde']:.3e}  "
+                    f"L_g={stats['L_g']:.3e}  L_wall={stats['L_wall']:.3e}  L_far={stats['L_far']:.3e}  "
+                    f"dy1Om00={stats['dy1Om00']:.6f}  lam={stats['lam']:.6f}  lr={lr_now:.2e}"
+                )
+
+            if save_every and (it % save_every == 0):
+                export_npz(os.path.join(out_dir, "latest.npz"), fields, grids, it=it)
+                export_npz(os.path.join(out_dir, f"ckpt_{it:06d}.npz"), fields, grids, it=it)
+
+        # final save
+        export_npz(os.path.join(out_dir, "final.npz"), fields, grids, it=iters)
+
+    finally:
+        csv_f.close()
 
     return fields, grids
-
-
-# ----------------------------
-# IO helpers
-# ----------------------------
-
-@torch.no_grad()
-def export_npz(path, fields, grids):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    dy1_c = grids["dy1_c"]
-    dy2_c = grids["dy2_c"]
-
-    U1x = fields.U1x
-    U2y = fields.U2y
-    Om, U1c, U2c, _, _ = omega_center(U1x, U2y, dy1_c, dy2_c)
-
-    np.savez_compressed(
-        path,
-        lam=float(fields.lam.detach().cpu().item()),
-        y1_c=grids["y1_c"].detach().cpu().numpy(),
-        y2_c=grids["y2_c"].detach().cpu().numpy(),
-        Omega=Om.detach().cpu().numpy(),
-        U1=U1c.detach().cpu().numpy(),
-        U2=U2c.detach().cpu().numpy(),
-        Phi=fields.Phi.detach().cpu().numpy(),
-        Psi=fields.Psi.detach().cpu().numpy(),
-    )
 
 
 # ----------------------------
@@ -553,14 +599,16 @@ def main():
         device=device,
         dtype=torch.float64,
         learn_lambda=False,
-        iters=100000, lr=2e-3, print_every=200,
+        iters=100_000, lr=2e-3, print_every=200,
         enforce_reflection_wall=True,
         seed=0,
+        csv_path="out_boussinesq/loss.csv",
+        out_dir="out_boussinesq",
+        save_every=10_000,
     )
     print("Done.")
 
-    export_npz("solution.npz", fields, grids)
-    visualize(fields, grids)
+    visualize(fields, grids, path="out_boussinesq/view.png")
 
 
 if __name__ == "__main__":
