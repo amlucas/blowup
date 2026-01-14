@@ -551,7 +551,8 @@ def main():
         seed=0,
     )
     print("Done.")
-    export_npz("runs/boussinesq/solution.npz", fields, grids)
+
+    export_npz("solution.npz", fields, grids)
     visualize(fields, grids)
 
 
