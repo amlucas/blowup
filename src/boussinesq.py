@@ -231,13 +231,17 @@ def center_to_yface_bt(qc):
     qB[:, -1] = qc[:, -1]; qT[:, -1] = qc[:, -1]
     return qB, qT
 
+def smooth_upwind(qL, qR, W, eps=1e-3):
+    # s ~ +1 if W>>0, s ~ -1 if W<<0
+    s = torch.tanh(W / eps)
+    return 0.5 * ((1+s)*qL + (1-s)*qR)
 
 def fv_advective_term(qc, W1x, W2y, dy1_c, dy2_c, divW_c):
     qL, qR = center_to_xface_lr(qc)
     qB, qT = center_to_yface_bt(qc)
 
-    qx = torch.where(W1x >= 0, qL, qR)
-    qy = torch.where(W2y >= 0, qB, qT)
+    qx = smooth_upwind(qL, qR, W1x, eps=1e-3)
+    qy = smooth_upwind(qB, qT, W2y, eps=1e-3)
 
     Fx = W1x * qx
     Fy = W2y * qy
@@ -447,8 +451,10 @@ def export_npz(path, fields, grids, it=None):
     np.savez_compressed(path, **payload)
 
 # ----------------------------
-# Solve (Adam)
+# Main loop
 # ----------------------------
+
+# --- add/replace in your script: LBFGS phase after Adam ---
 
 def solve_torch(
     n1=257, n2=129, L1=60.0, L2=60.0,
@@ -461,6 +467,15 @@ def solve_torch(
     log_every=1,
     out_dir="runs/boussinesq",
     save_every=10_000,
+    # NEW:
+    adam_iters=50_000,
+    lbfgs_iters=50_000,
+    lbfgs_lr=1.0,
+    lbfgs_max_iter=20,
+    lbfgs_history_size=50,
+    lbfgs_tol_grad=1e-10,
+    lbfgs_tol_change=1e-12,
+    lbfgs_line_search="strong_wolfe",
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -471,18 +486,35 @@ def solve_torch(
     fields = Fields(n1, n2, lam0=lam0, device=device, dtype=dtype, learn_lambda=learn_lambda, seed=seed)
     init_fields(fields, grids)
 
-    weights = {"pde": 50.0, "gauge": 10.0, "wall": 10.0, "far": 50.0}
-    opt = torch.optim.Adam(fields.parameters(), lr=lr)
+    weights = {"pde": 100.0, "gauge": 1.0, "wall": 50.0, "far": 5.0}
 
-    fieldnames = ["it", "time_s", "lr", "L", "L_pde", "L_g", "L_wall", "L_far", "dy1Om00", "lam"]
+    fieldnames = ["it", "phase", "time_s", "lr", "L", "L_pde", "L_g", "L_wall", "L_far", "dy1Om00", "lam"]
     t0 = time.time()
     csv_f, csv_w = open_loss_csv(csv_path, fieldnames)
 
     out_dir = os.path.expanduser(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
+    def log_row(it, phase, lr_now, stats):
+        row = {"it": it, "phase": phase, "time_s": time.time() - t0, "lr": lr_now, **stats}
+        csv_w.writerow(row)
+        csv_f.flush()
+
+    def maybe_save(it):
+        if save_every and (it % save_every == 0):
+            export_npz(os.path.join(out_dir, "latest.npz"), fields, grids, it=it)
+            export_npz(os.path.join(out_dir, f"ckpt_{it:06d}.npz"), fields, grids, it=it)
+
+    it_global = 0
+
     try:
-        for it in range(1, iters + 1):
+        # ----------------
+        # Phase 1: Adam
+        # ----------------
+        opt = torch.optim.Adam(fields.parameters(), lr=lr)
+
+        for k in range(1, adam_iters + 1):
+            it_global += 1
             opt.zero_grad(set_to_none=True)
             L, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
             L.backward()
@@ -491,31 +523,77 @@ def solve_torch(
 
             lr_now = opt.param_groups[0]["lr"]
 
-            if (it % log_every) == 0:
-                row = {"it": it, "time_s": time.time() - t0, "lr": lr_now, **stats}
-                csv_w.writerow(row)
-                csv_f.flush()
+            if (it_global % log_every) == 0:
+                log_row(it_global, "adam", lr_now, stats)
 
-            if it % print_every == 0 or it == 1:
+            if it_global % print_every == 0 or it_global == 1:
                 print(
-                    f"[adam {it:06d}] "
+                    f"[adam  {it_global:06d}] "
                     f"L={stats['L']:.3e}  L_pde={stats['L_pde']:.3e}  "
                     f"L_g={stats['L_g']:.3e}  L_wall={stats['L_wall']:.3e}  L_far={stats['L_far']:.3e}  "
                     f"dy1Om00={stats['dy1Om00']:.6f}  lam={stats['lam']:.6f}  lr={lr_now:.2e}"
                 )
 
-            if save_every and (it % save_every == 0):
-                export_npz(os.path.join(out_dir, "latest.npz"), fields, grids, it=it)
-                export_npz(os.path.join(out_dir, f"ckpt_{it:06d}.npz"), fields, grids, it=it)
+            maybe_save(it_global)
 
-        # final save
-        export_npz(os.path.join(out_dir, "final.npz"), fields, grids, it=iters)
+        # Save right before LBFGS starts
+        export_npz(os.path.join(out_dir, "pre_lbfgs.npz"), fields, grids, it=it_global)
+
+        # ----------------
+        # Phase 2: LBFGS
+        # ----------------
+        lbfgs = torch.optim.LBFGS(
+            fields.parameters(),
+            lr=lbfgs_lr,
+            max_iter=lbfgs_max_iter,          # inner iterations per .step()
+            history_size=lbfgs_history_size,
+            tolerance_grad=lbfgs_tol_grad,
+            tolerance_change=lbfgs_tol_change,
+            line_search_fn=lbfgs_line_search,
+        )
+
+        last = {"stats": None, "loss": None}
+
+        def closure():
+            lbfgs.zero_grad(set_to_none=True)
+            L, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
+            L.backward()
+            last["stats"] = stats
+            last["loss"] = L
+            return L
+
+        for k in range(1, lbfgs_iters + 1):
+            it_global += 1
+
+            # One "outer" LBFGS step (will call closure multiple times internally)
+            lbfgs.step(closure)
+
+            stats = last["stats"]
+            if stats is None:
+                # extremely unlikely, but keep it safe
+                _, stats = loss_total(fields, grids, masks, weights, enforce_reflection_wall=enforce_reflection_wall)
+
+            lr_now = lbfgs.param_groups[0]["lr"]
+
+            if (it_global % log_every) == 0:
+                log_row(it_global, "lbfgs", lr_now, stats)
+
+            if it_global % print_every == 0 or it_global == (adam_iters + 1):
+                print(
+                    f"[lbfgs {it_global:06d}] "
+                    f"L={stats['L']:.3e}  L_pde={stats['L_pde']:.3e}  "
+                    f"L_g={stats['L_g']:.3e}  L_wall={stats['L_wall']:.3e}  L_far={stats['L_far']:.3e}  "
+                    f"dy1Om00={stats['dy1Om00']:.6f}  lam={stats['lam']:.6f}  lr={lr_now:.2e}"
+                )
+
+            maybe_save(it_global)
+
+        export_npz(os.path.join(out_dir, "final.npz"), fields, grids, it=it_global)
 
     finally:
         csv_f.close()
 
     return fields, grids
-
 
 # ----------------------------
 # Viz
@@ -599,12 +677,18 @@ def main():
         device=device,
         dtype=torch.float64,
         learn_lambda=False,
-        iters=100_000, lr=2e-3, print_every=200,
         enforce_reflection_wall=True,
         seed=0,
         csv_path="out_boussinesq/loss.csv",
         out_dir="out_boussinesq",
         save_every=10_000,
+        log_every=1,
+        print_every=200,
+        adam_iters=20_000,
+        lbfgs_iters=50_000,
+        lr=2e-3,
+        lbfgs_lr=1.0,
+        lbfgs_max_iter=20,
     )
     print("Done.")
 
